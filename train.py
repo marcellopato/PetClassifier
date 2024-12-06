@@ -4,6 +4,9 @@ from tensorflow.keras import layers, models
 import matplotlib.pyplot as plt
 import os
 import pathlib
+import io
+import numpy as np
+from PIL import Image
 
 # Constants
 IMG_SIZE = 224  # Changed from 160 to 224 to match MobileNetV2's requirements
@@ -11,139 +14,212 @@ BATCH_SIZE = 32
 EPOCHS = 10
 AUTOTUNE = tf.data.AUTOTUNE
 
-def decode_img(img):
+def decode_img(file_path):
     try:
-        # Convert the compressed string to a tensor
-        img = tf.io.decode_image(img, channels=3, expand_animations=False)
+        # Read the image file
+        img_raw = tf.io.read_file(file_path)
         
-        # Ensure we have a valid image
-        if tf.rank(img) != 3 or tf.shape(img)[2] not in [1, 2, 3, 4]:
+        # Check if the file is empty
+        if tf.equal(tf.size(img_raw), 0):
+            tf.print("Empty file:", file_path)
             return None
             
-        # Convert grayscale to RGB if needed
-        if tf.shape(img)[2] == 1:
-            img = tf.image.grayscale_to_rgb(img)
-        elif tf.shape(img)[2] == 2:
-            # For 2-channel images, duplicate one channel to make it RGB
-            img = tf.concat([img[..., :1], img[..., :1], img[..., :1]], axis=-1)
-        elif tf.shape(img)[2] == 4:
-            # For RGBA images, just take the RGB channels
-            img = img[..., :3]
+        # Try different decoding methods
+        img = None
+        
+        # Method 1: Try decode_jpeg
+        try:
+            img = tf.io.decode_jpeg(img_raw, channels=3)
+            img = tf.cast(img, tf.float32)
+        except Exception as e:
+            tf.print("JPEG decode failed:", str(e), "Path:", file_path)
             
-        # Resize the image to the desired size
+        # Method 2: Try decode_png if JPEG failed
+        if img is None:
+            try:
+                img = tf.io.decode_png(img_raw, channels=3)
+                img = tf.cast(img, tf.float32)
+            except Exception as e:
+                tf.print("PNG decode failed:", str(e), "Path:", file_path)
+                
+        # Method 3: Try PIL if both TensorFlow methods failed
+        if img is None:
+            try:
+                # Convert the raw bytes to a PIL Image
+                img_bytes = img_raw.numpy()
+                img_pil = Image.open(io.BytesIO(img_bytes))
+                
+                # Convert to RGB if necessary
+                if img_pil.mode != 'RGB':
+                    img_pil = img_pil.convert('RGB')
+                    
+                # Resize image
+                img_pil = img_pil.resize((IMG_SIZE, IMG_SIZE), Image.Resampling.LANCZOS)
+                
+                # Convert to numpy array
+                img_array = np.array(img_pil, dtype=np.float32)
+                
+                # Convert to tensor
+                img = tf.convert_to_tensor(img_array)
+                
+                tf.print("Successfully decoded with PIL:", file_path)
+                
+            except Exception as e:
+                tf.print("PIL decode failed:", str(e), "Path:", file_path)
+                return None
+                
+        # If all methods failed, return None
+        if img is None:
+            tf.print("All decode methods failed for:", file_path)
+            return None
+            
+        # Get image shape
+        shape = tf.shape(img)
+        
+        # Check image dimensions
+        if shape[0] < 32 or shape[1] < 32:
+            tf.print("Image too small:", shape, "Path:", file_path)
+            return None
+            
+        # Resize if needed
+        if shape[0] != IMG_SIZE or shape[1] != IMG_SIZE:
+            img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
+            
+        # Ensure we're working with float32
         img = tf.cast(img, tf.float32)
-        img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])
+            
+        # Check for NaN or Inf values
+        if tf.reduce_any(tf.math.is_nan(img)) or tf.reduce_any(tf.math.is_inf(img)):
+            tf.print("Invalid values in image:", file_path)
+            return None
+            
+        # Check pixel range
+        min_val = tf.reduce_min(img)
+        max_val = tf.reduce_max(img)
+        if min_val < 0 or max_val > 255:
+            tf.print("Invalid pixel range:", min_val, max_val, "Path:", file_path)
+            return None
+            
+        # Normalize to [0,1]
+        img = img / 255.0
+        
+        # Return the processed image
         return img
-    except:
+        
+    except Exception as e:
+        tf.print("Unexpected error in decode_img:", str(e), "Path:", file_path)
         return None
 
 def process_path(file_path):
-    try:
-        # Convert file_path tensor to string for logging
-        file_path_str = tf.strings.as_string(file_path)
+    # Get the label
+    parts = tf.strings.split(file_path, os.path.sep)
+    label = parts[-2]
+    label = tf.cast(label == "dogs", tf.int32)
+    
+    # Get and process the image
+    img = decode_img(file_path)
+    
+    if img is None:
+        # Return a default image if decoding fails
+        img = tf.zeros([IMG_SIZE, IMG_SIZE, 3], dtype=tf.float32)
         
-        # Load the raw data from the file as a string
-        img = tf.io.read_file(file_path)
-        img = decode_img(img)
-        
-        # Skip if we got a None image (error case)
-        if img is None:
-            tf.print("Error processing image:", file_path_str)
-            return (
-                tf.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32),
-                tf.constant(0.0, dtype=tf.float32)
-            )
-            
-        # Normalize pixel values and ensure shape
-        img = img / 255.0
-        img = tf.ensure_shape(img, (IMG_SIZE, IMG_SIZE, 3))
-        
-        # Determine class based on path
-        label = tf.strings.split(file_path, os.path.sep)[-2]
-        label = tf.cast(tf.equal(label, "dogs"), tf.float32)
-        
-        # Verify the image has valid values
-        if tf.reduce_any(tf.math.is_nan(img)) or tf.reduce_any(tf.math.is_inf(img)):
-            tf.print("Invalid pixel values in image:", file_path_str)
-            return (
-                tf.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32),
-                tf.constant(0.0, dtype=tf.float32)
-            )
-            
-        return img, label
-    except Exception as e:
-        tf.print("Error processing image:", file_path_str, "Error:", str(e))
-        return (
-            tf.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32),
-            tf.constant(0.0, dtype=tf.float32)
-        )
+    return img, label
 
 def prepare_dataset(data_dir, is_training=True):
+    # Get dataset size first
     data_dir = pathlib.Path(data_dir)
+    image_count = len(list(data_dir.glob('*/*.jpg')))
+    print(f"\nFound {image_count} images in {data_dir}")
     
-    # Get list of files
+    # Create the dataset
     list_ds = tf.data.Dataset.list_files(str(data_dir/'*/*'), shuffle=is_training)
-    dataset_size = len(list(data_dir.glob('*/*')))
     
-    # Process files and filter out errors
+    # Set the dataset size
+    dataset_size = image_count
+    
+    # Process the images in parallel with error handling
     labeled_ds = list_ds.map(
         process_path,
         num_parallel_calls=AUTOTUNE
     )
     
-    # Filter out error cases (all zero images)
-    labeled_ds = labeled_ds.filter(
-        lambda x, y: tf.math.reduce_any(tf.math.not_equal(x, 0.0))
+    # Filter out error cases and extract only image and label
+    valid_count = tf.Variable(0, dtype=tf.int32)
+    invalid_count = tf.Variable(0, dtype=tf.int32)
+    
+    def count_valid(x, y):
+        valid_count.assign_add(1)
+        return True
+        
+    labeled_ds = labeled_ds.map(
+        lambda x, y: (x, y),
+        num_parallel_calls=AUTOTUNE
     )
     
-    if is_training:
-        # Add data augmentation for training
-        labeled_ds = labeled_ds.map(
-            lambda x, y: (tf.image.random_flip_left_right(x), y),
-            num_parallel_calls=AUTOTUNE
-        )
-        labeled_ds = labeled_ds.map(
-            lambda x, y: (tf.image.random_brightness(x, 0.2), y),
-            num_parallel_calls=AUTOTUNE
-        )
-        # For training, repeat indefinitely
-        labeled_ds = labeled_ds.repeat()
-    else:
-        # For validation, repeat only once
-        labeled_ds = labeled_ds.repeat(1)
+    # Print dataset statistics
+    print(f"\nDataset Statistics:")
+    print(f"Total images: {dataset_size}")
+    print(f"Valid images: {valid_count.numpy()}")
+    print(f"Invalid images: {invalid_count.numpy()}")
     
-    # Cache, shuffle, batch, and prefetch
+    if is_training:
+        # Data augmentation only during training
+        data_augmentation = tf.keras.Sequential([
+            tf.keras.layers.RandomFlip("horizontal"),
+            tf.keras.layers.RandomRotation(0.2),
+            tf.keras.layers.RandomZoom(0.2),
+        ])
+        
+        labeled_ds = labeled_ds.map(
+            lambda x, y: (data_augmentation(x, training=True), y),
+            num_parallel_calls=AUTOTUNE
+        )
+    
+    # Set batching and prefetching
     labeled_ds = labeled_ds.cache()
     if is_training:
-        labeled_ds = labeled_ds.shuffle(1000)
+        labeled_ds = labeled_ds.shuffle(buffer_size=1000)
     labeled_ds = labeled_ds.batch(BATCH_SIZE)
     labeled_ds = labeled_ds.prefetch(buffer_size=AUTOTUNE)
     
     return labeled_ds, dataset_size
 
 def create_model():
+    # Create data augmentation layer
+    data_augmentation = tf.keras.Sequential([
+        tf.keras.layers.RandomFlip("horizontal"),
+        tf.keras.layers.RandomRotation(0.1),
+        tf.keras.layers.RandomZoom(0.1),
+    ])
+    
+    # Create the base model from the pre-trained model MobileNetV2
     base_model = tf.keras.applications.MobileNetV2(
-        input_shape=(224, 224, 3),
+        input_shape=(IMG_SIZE, IMG_SIZE, 3),
         include_top=False,
         weights='imagenet'
     )
     base_model.trainable = False
 
-    model = tf.keras.Sequential([
-        base_model,
-        tf.keras.layers.GlobalAveragePooling2D(),
-        tf.keras.layers.Dropout(0.2),
-        tf.keras.layers.Dense(1)  # No activation for logits
-    ])
+    # Create new model on top
+    inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    x = data_augmentation(inputs)
+    x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
+    x = base_model(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    outputs = tf.keras.layers.Dense(1, activation='sigmoid')(x)
+    
+    model = tf.keras.Model(inputs, outputs)
 
+    # Compile the model
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+        loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
         metrics=[
-            tf.keras.metrics.BinaryAccuracy(name='binary_accuracy', threshold=0.0),  # For logits
-            tf.keras.metrics.AUC(name='auc', from_logits=True),
-            tf.keras.metrics.Precision(name='precision', thresholds=0.0),  # For logits
-            tf.keras.metrics.Recall(name='recall', thresholds=0.0)  # For logits
+            tf.keras.metrics.BinaryAccuracy(name='accuracy'),
+            tf.keras.metrics.AUC(name='auc'),
+            tf.keras.metrics.Precision(name='precision'),
+            tf.keras.metrics.Recall(name='recall')
         ]
     )
     
@@ -151,46 +227,62 @@ def create_model():
 
 def plot_training_results(history):
     # Print available metrics for debugging
-    print("\nAvailable metrics:", history.history.keys())
+    print("\nPlotting training results...")
+    print("Available metrics:", history.history.keys())
     
     # Define metrics to plot with their display names
     metrics_info = [
-        ('binary_accuracy', 'Accuracy'),
+        ('accuracy', 'Accuracy'),
         ('loss', 'Loss'),
         ('auc', 'AUC'),
         ('precision', 'Precision'),
         ('recall', 'Recall')
     ]
     
-    plt.figure(figsize=(15, 10))
+    # Create figure with subplots
+    fig = plt.figure(figsize=(15, 10))
     
-    for i, (metric, title) in enumerate(metrics_info):
-        plt.subplot(2, 3, i+1)
+    for i, (metric, title) in enumerate(metrics_info, 1):
+        ax = fig.add_subplot(2, 3, i)
         
         # Plot training
         if metric in history.history:
-            plt.plot(history.history[metric], label=f'Training {title}')
+            train_values = history.history[metric]
+            ax.plot(train_values, label=f'Training {title}')
+            print(f"\nTraining {title}:")
+            print(f"  Start: {train_values[0]:.4f}")
+            print(f"  End: {train_values[-1]:.4f}")
+            print(f"  Best: {max(train_values):.4f}")
         else:
             print(f"Warning: {metric} not found in history")
         
         # Plot validation
         val_metric = f'val_{metric}'
         if val_metric in history.history:
-            plt.plot(history.history[val_metric], label=f'Validation {title}')
+            val_values = history.history[val_metric]
+            ax.plot(val_values, label=f'Validation {title}')
+            print(f"\nValidation {title}:")
+            print(f"  Start: {val_values[0]:.4f}")
+            print(f"  End: {val_values[-1]:.4f}")
+            print(f"  Best: {max(val_values):.4f}")
         else:
             print(f"Warning: {val_metric} not found in history")
         
-        plt.title(f'Training and Validation {title}')
-        plt.xlabel('Epoch')
-        plt.ylabel(title)
-        plt.legend()
+        ax.set_title(f'Training and Validation {title}')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(title)
+        ax.legend()
+        ax.grid(True)
     
     plt.tight_layout()
+    
+    # Save plot
     try:
         plt.savefig('training_results.png')
-        print("Training plots saved successfully")
+        print("\nTraining plots saved successfully to 'training_results.png'")
     except Exception as e:
-        print(f"Error saving training plots: {str(e)}")
+        print(f"\nError saving training plots: {str(e)}")
+    
     plt.close()
 
 def main():
@@ -229,11 +321,11 @@ def main():
         tf.keras.callbacks.ModelCheckpoint(
             filepath='models/pet_classifier.keras',
             save_best_only=True,
-            monitor='val_binary_accuracy',
+            monitor='val_accuracy',
             mode='max'
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor='val_binary_accuracy',
+            monitor='val_accuracy',
             patience=3,
             restore_best_weights=True
         ),
@@ -247,18 +339,42 @@ def main():
 
     # Train the model
     print("\nStarting training...")
-    history = model.fit(
-        train_ds,
-        epochs=EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds,
-        validation_steps=validation_steps,
-        callbacks=callbacks
-    )
+    try:
+        history = model.fit(
+            train_ds,
+            epochs=EPOCHS,
+            steps_per_epoch=steps_per_epoch,
+            validation_data=val_ds,
+            validation_steps=validation_steps,
+            callbacks=callbacks,
+            verbose=1  # Ensure we see detailed progress
+        )
+        
+        # Verify that we have training history
+        if not history.history:
+            print("Warning: Training history is empty!")
+            return
+            
+        # Print training summary
+        print("\nTraining Summary:")
+        for metric in history.history.keys():
+            values = history.history[metric]
+            print(f"{metric}:")
+            print(f"  Start: {values[0]:.4f}")
+            print(f"  End: {values[-1]:.4f}")
+            print(f"  Best: {max(values):.4f}")
+        
+    except Exception as e:
+        print(f"Error during training: {str(e)}")
+        return
 
     # Save the final model
-    print("\nSaving model...")
-    model.save('models/pet_classifier.keras')
+    try:
+        print("\nSaving model...")
+        model.save('models/pet_classifier.keras')
+        print("Model saved successfully!")
+    except Exception as e:
+        print(f"Error saving model: {str(e)}")
 
     # Plot results
     print("Generating training plots...")
@@ -266,8 +382,8 @@ def main():
     
     # Print final metrics
     print("\nTraining completed!")
-    if 'val_binary_accuracy' in history.history:
-        print(f"Final validation accuracy: {history.history['val_binary_accuracy'][-1]:.2%}")
+    if 'val_accuracy' in history.history:
+        print(f"Final validation accuracy: {history.history['val_accuracy'][-1]:.2%}")
     if 'val_auc' in history.history:
         print(f"Final validation AUC: {history.history['val_auc'][-1]:.4f}")
     if 'val_precision' in history.history:
