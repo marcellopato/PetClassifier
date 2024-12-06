@@ -51,3 +51,7 @@ img/
 pictures/
 photos/
 assets/images/
+
+# Large files
+temp_download/
+*.zip
